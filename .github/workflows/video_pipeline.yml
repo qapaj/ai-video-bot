@@ -1,0 +1,226 @@
+name: Video Generation Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      topic:
+        description: 'Video topic'
+        required: true
+        type: string
+      video_type:
+        description: 'news / story / facts / education'
+        required: true
+        type: string
+        default: 'news'
+      chat_id:
+        description: 'Telegram chat ID'
+        required: true
+        type: string
+      message_id:
+        required: false
+        type: string
+      language:
+        description: 'ar / en / fr / es / de'
+        required: false
+        type: string
+        default: 'ar'
+      voice_gender:
+        description: 'female / male'
+        required: false
+        type: string
+        default: 'female'
+      quality:
+        description: 'standard / high'
+        required: false
+        type: string
+        default: 'standard'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  generate-video:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Python ────────────────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # ── Caches ────────────────────────────────────────────────────────────────
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-v7-${{ hashFiles('requirements.txt') }}
+          restore-keys: pip-v7-
+
+      - name: Cache audio segments (TTS)
+        uses: actions/cache@v4
+        with:
+          path: /tmp/pipeline_cache/audio
+          key: audio-v7-${{ runner.os }}
+
+      - name: Cache apt
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives
+          key: apt-v7-${{ runner.os }}
+
+      # ── System packages ───────────────────────────────────────────────────────
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            ffmpeg \
+            espeak-ng \
+            espeak-ng-data \
+            libespeak-ng-dev \
+            imagemagick \
+            fonts-dejavu \
+            fonts-freefont-ttf \
+            fonts-noto fonts-noto-core \
+            fontconfig \
+            python3-dev build-essential \
+            libsndfile1 wget
+
+          # Arabic font for subtitles
+          FONT_DIR="/usr/local/share/fonts/arabic"
+          sudo mkdir -p "$FONT_DIR"
+          if [ ! -f "$FONT_DIR/NotoNaskhArabic-Regular.ttf" ]; then
+            sudo wget -q -O "$FONT_DIR/NotoNaskhArabic-Regular.ttf" \
+              "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoNaskhArabic/NotoNaskhArabic-Regular.ttf" \
+              && echo "✓ Arabic font" || echo "⚠ Font download failed"
+          fi
+          sudo fc-cache -fv >/dev/null 2>&1
+
+          sudo sed -i \
+            's/rights="none" pattern="PDF"/rights="read|write" pattern="PDF"/' \
+            /etc/ImageMagick-6/policy.xml 2>/dev/null || true
+
+          echo "=== espeak-ng Arabic test ==="
+          espeak-ng -v ar -w /tmp/esp_test.wav "مرحبا" 2>&1 \
+            && echo "✓ espeak Arabic" || echo "✗ espeak Arabic failed"
+
+      # ── Python deps ───────────────────────────────────────────────────────────
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip wheel setuptools
+          python -m pip install -r requirements.txt
+
+          echo "=== Package verification ==="
+          python -c "import requests;         print('✓ requests')"
+          python -c "import edge_tts;         print('✓ edge-tts', edge_tts.__version__)" \
+            || echo "✗ edge-tts MISSING"
+          python -c "import arabic_reshaper;  print('✓ arabic-reshaper')" \
+            || echo "✗ arabic-reshaper MISSING"
+          python -c "from bidi.algorithm import get_display; print('✓ python-bidi')" \
+            || echo "✗ python-bidi MISSING"
+
+          echo "=== edge-tts CLI ==="
+          which edge-tts && echo "✓ on PATH" || echo "✗ not on PATH"
+          edge-tts --list-voices 2>/dev/null | grep -c Neural \
+            && echo "✓ edge-tts CLI working" || echo "⚠ edge-tts CLI issue"
+
+      # ── Audio diagnostics ─────────────────────────────────────────────────────
+      - name: Audio backend diagnostics
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'EOF'
+          import os, subprocess, sys
+          sys.path.insert(0, '.')
+
+          print("=== TTS Backend Diagnostic ===")
+          lang = "${{ github.event.inputs.language }}" or "ar"
+          test_text = {"ar": "مرحبا", "en": "Hello", "fr": "Bonjour",
+                       "es": "Hola", "de": "Hallo"}.get(lang, "Hello")
+
+          # 1. HF API
+          token = os.environ.get("HF_TOKEN", "")
+          if token:
+              print(f"HF_TOKEN: set ({len(token)} chars)")
+              try:
+                  import requests
+                  r = requests.head(
+                      "https://api-inference.huggingface.co/models/coqui/XTTS-v2",
+                      headers={"Authorization": f"Bearer {token}"},
+                      timeout=10,
+                  )
+                  print(f"  XTTS-v2 API: HTTP {r.status_code} "
+                        f"({'reachable' if r.status_code in (200,503) else 'error'})")
+                  r2 = requests.head(
+                      "https://api-inference.huggingface.co/models/facebook/mms-tts-ara",
+                      headers={"Authorization": f"Bearer {token}"},
+                      timeout=10,
+                  )
+                  print(f"  MMS-Arabic:  HTTP {r2.status_code} "
+                        f"({'reachable' if r2.status_code in (200,503) else 'error'})")
+              except Exception as e:
+                  print(f"  HF reachability check failed: {e}")
+          else:
+              print("HF_TOKEN: NOT SET — add it as a GitHub Secret!")
+              print("  HF TTS backends will be SKIPPED")
+
+          # 2. edge-tts CLI
+          r = subprocess.run(["edge-tts", "--list-voices"],
+                             capture_output=True, text=True, timeout=15)
+          if r.returncode == 0:
+              count = r.stdout.count("Neural")
+              print(f"edge-tts CLI: {count} Neural voices available")
+          else:
+              print(f"edge-tts CLI: ERROR rc={r.returncode}")
+
+          # 3. espeak
+          r2 = subprocess.run(["espeak-ng", "--version"],
+                              capture_output=True, text=True)
+          print(f"espeak-ng: {'OK ' + r2.stdout.split(chr(10))[0] if r2.returncode == 0 else 'NOT FOUND'}")
+
+          # 4. FFmpeg
+          r3 = subprocess.run(["ffmpeg", "-version"],
+                              capture_output=True, text=True)
+          ver = r3.stdout.split("\\n")[0] if r3.returncode == 0 else "NOT FOUND"
+          print(f"ffmpeg: {ver[:60]}")
+          EOF
+
+      # ── Smoke test ─────────────────────────────────────────────────────────────
+      - name: Smoke test
+        env:
+          VIDEO_LANGUAGE: ${{ github.event.inputs.language }}
+          VIDEO_TYPE:     ${{ github.event.inputs.video_type }}
+          HF_TOKEN:       ${{ secrets.HF_TOKEN }}
+        run: python main.py test
+
+      # ── Run pipeline ─────────────────────────────────────────────────────────
+      - name: Run video pipeline
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          PEXELS_API_KEY:     ${{ secrets.PEXELS_API_KEY }}
+          PIXABAY_API_KEY:    ${{ secrets.PIXABAY_API_KEY }}
+          HF_TOKEN:           ${{ secrets.HF_TOKEN }}
+          CHAT_ID:            ${{ github.event.inputs.chat_id }}
+          VIDEO_TOPIC:        ${{ github.event.inputs.topic }}
+          VIDEO_TYPE:         ${{ github.event.inputs.video_type }}
+          VIDEO_LANGUAGE:     ${{ github.event.inputs.language }}
+          VOICE_GENDER:       ${{ github.event.inputs.voice_gender }}
+          VIDEO_QUALITY:      ${{ github.event.inputs.quality }}
+          MESSAGE_ID:         ${{ github.event.inputs.message_id }}
+          WORK_DIR:           /tmp/pipeline_work
+          OUTPUT_DIR:         output
+        run: python main.py pipeline
+
+      # ── Artifact ─────────────────────────────────────────────────────────────
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-${{ github.run_id }}
+          path: output/
+          retention-days: 1
+          if-no-files-found: ignore

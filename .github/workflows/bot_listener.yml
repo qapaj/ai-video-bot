@@ -1,0 +1,60 @@
+name: Telegram Bot Listener
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  listen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip (listener)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: listener-pip-v6-requests
+          restore-keys: listener-pip-v6-
+
+      - name: Install listener dependencies
+        run: python -m pip install requests==2.31.0 --quiet
+
+      - name: Run bot listener (265s window)
+        env:
+          TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          GITHUB_TOKEN:        ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPO:         ${{ github.repository }}
+          POLL_WINDOW_SECONDS: "265"
+        run: python main.py bot
+
+      - name: Self-restart if cron gap is large
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPO:  ${{ github.repository }}
+        run: |
+          MINUTE=$(date +%M)
+          REMAINDER=$((MINUTE % 5))
+          if [ "$REMAINDER" -gt "2" ]; then
+            echo "Triggering early restart (${REMAINDER}min until next cron)..."
+            curl -s -X POST \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPO}/actions/workflows/bot_listener.yml/dispatches" \
+              -d '{"ref":"main"}' || true
+          else
+            echo "Next cron <2min away, letting it run."
+          fi
