@@ -8,7 +8,7 @@ Fallback chain (priority order):
   2. edge-tts Python API      (Microsoft Neural, via Python library - FIXED)
   3. HF MMS-TTS API           (language-specific, reliable)
   4. HF SpeechT5 API          (lightweight, fast)
-  5. edge-tts CLI             (same, different invocation path)
+  5. edge-tts CLI             (Disabled to prevent Errno 2)
   6. espeak-ng                (always on Ubuntu runners)
   7. Silent WAV               (guaranteed non-crash final fallback)
 
@@ -64,12 +64,12 @@ class AudioEngine:
         self._hf        = self._init_hf()
         self._processor = self._init_processor()
         self._cache     = self._init_cache()
-        self._edge_cli  = self._find_edge_cli()
+        self._edge_cli  = self._find_edge_cli()  # Will now safely return None
         self._espeak_ok = self._check_espeak()
 
         log.info("AudioEngine | HF=%s | edge-tts=%s | espeak=%s",
                  "YES" if self._hf else "NO (set HF_TOKEN secret)",
-                 "YES" if self._edge_cli else "NO",
+                 "YES" if self._edge_cli else "NO (Using Python API)",
                  "YES" if self._espeak_ok else "NO")
 
     # ── Public ─────────────────────────────────────────────────────────────────
@@ -126,7 +126,7 @@ class AudioEngine:
                 log.debug("  Cache HIT")
                 return True
 
-        # 2. Try backends in priority order (MODIFIED: edge Python prioritized)
+        # 2. Try backends in priority order (Python API prioritized, CLI disabled)
         backends = [
             ("HF TTS API",       lambda: self._b_hf(text, out, lang)),
             ("edge-tts Python",  lambda: self._b_edge_python(text, out, lang, gender)),
@@ -173,6 +173,7 @@ class AudioEngine:
     def _b_edge_cli(self, text: str, out: str, lang: str, gender: str) -> bool:
         if not self._edge_cli:
             return False
+        # Code here is kept but will effectively not run because _edge_cli is None
         voices = EDGE_TTS_VOICES.get(lang, EDGE_TTS_VOICES["ar"])
         vlist  = voices.get(gender, voices.get("female", []))
         mp3    = out.replace(".aac", "_edge.mp3")
@@ -336,18 +337,16 @@ class AudioEngine:
 
     @staticmethod
     def _find_edge_cli() -> Optional[str]:
-        r = subprocess.run(["which", "edge-tts"],
-                           capture_output=True, text=True)
-        if r.returncode == 0 and r.stdout.strip():
-            return r.stdout.strip()
-        r2 = subprocess.run(["edge-tts", "--list-voices"],
-                            capture_output=True, text=True, timeout=10)
-        return "edge-tts" if r2.returncode == 0 else None
+        # FIXED: Always return None to prevent subprocess Errno 2 when edge-tts CLI is missing
+        return None
 
     @staticmethod
     def _check_espeak() -> bool:
-        r = subprocess.run(["espeak-ng", "--version"], capture_output=True)
-        return r.returncode == 0
+        try:
+            r = subprocess.run(["espeak-ng", "--version"], capture_output=True)
+            return r.returncode == 0
+        except Exception:
+            return False
 
     def _find_music(self) -> Optional[str]:
         d = self._cfg.paths.music_dir
