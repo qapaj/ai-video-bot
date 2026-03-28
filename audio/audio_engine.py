@@ -5,10 +5,10 @@ Main audio engine — orchestrates the complete TTS pipeline.
 
 Fallback chain (priority order):
   1. HF XTTS-v2 API           (highest quality, multilingual)
-  2. HF MMS-TTS API           (language-specific, reliable)
-  3. HF SpeechT5 API          (lightweight, fast)
-  4. edge-tts CLI             (Microsoft Neural, no API key)
-  5. edge-tts Python API      (same, different invocation path)
+  2. edge-tts Python API      (Microsoft Neural, via Python library - FIXED)
+  3. HF MMS-TTS API           (language-specific, reliable)
+  4. HF SpeechT5 API          (lightweight, fast)
+  5. edge-tts CLI             (same, different invocation path)
   6. espeak-ng                (always on Ubuntu runners)
   7. Silent WAV               (guaranteed non-crash final fallback)
 
@@ -126,11 +126,11 @@ class AudioEngine:
                 log.debug("  Cache HIT")
                 return True
 
-        # 2. Try backends in priority order
+        # 2. Try backends in priority order (MODIFIED: edge Python prioritized)
         backends = [
             ("HF TTS API",       lambda: self._b_hf(text, out, lang)),
-            ("edge-tts CLI",     lambda: self._b_edge_cli(text, out, lang, gender)),
             ("edge-tts Python",  lambda: self._b_edge_python(text, out, lang, gender)),
+            ("edge-tts CLI",     lambda: self._b_edge_cli(text, out, lang, gender)),
             ("espeak-ng",        lambda: self._b_espeak(text, out, lang)),
             ("silent fallback",  lambda: self._b_silence(out)),
         ]
