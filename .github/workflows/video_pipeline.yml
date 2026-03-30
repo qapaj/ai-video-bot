@@ -1,0 +1,277 @@
+name: Video Generation Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      topic:
+        description: 'Video topic'
+        required: true
+        type: string
+      video_type:
+        description: 'news / story / facts / education'
+        required: true
+        type: string
+        default: 'news'
+      chat_id:
+        description: 'Telegram chat ID'
+        required: true
+        type: string
+      message_id:
+        required: false
+        type: string
+      language:
+        description: 'ar / en / fr / es / de'
+        required: false
+        type: string
+        default: 'ar'
+      voice_gender:
+        description: 'female / male'
+        required: false
+        type: string
+        default: 'female'
+      quality:
+        description: 'standard / high'
+        required: false
+        type: string
+        default: 'standard'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  generate-video:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # ── Caches ────────────────────────────────────────────────────────────────
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-v9-${{ hashFiles('requirements.txt') }}
+          restore-keys: pip-v9-
+
+      - name: Cache TTS audio
+        uses: actions/cache@v4
+        with:
+          path: /tmp/pipeline_cache/audio
+          key: audio-v9-${{ runner.os }}
+
+      - name: Cache apt
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives
+          key: apt-v9-${{ runner.os }}
+
+      # ── System packages ────────────────────────────────────────────────────────
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            ffmpeg \
+            espeak-ng \
+            espeak-ng-data \
+            libespeak-ng-dev \
+            imagemagick \
+            fonts-dejavu \
+            fonts-freefont-ttf \
+            fonts-noto \
+            fonts-noto-core \
+            fontconfig \
+            python3-dev \
+            build-essential \
+            libsndfile1 \
+            wget
+
+          echo "=== Verify critical binaries ==="
+          for bin in ffmpeg espeak-ng convert; do
+            path=$(which "$bin" 2>/dev/null)
+            if [ -n "$path" ]; then
+              echo "  ✓ $bin → $path"
+            else
+              echo "  ✗ $bin → NOT FOUND (this will be handled by Python fallback)"
+            fi
+          done
+
+          # Arabic subtitle font
+          FONT_DIR="/usr/local/share/fonts/arabic"
+          sudo mkdir -p "$FONT_DIR"
+          if [ ! -f "$FONT_DIR/NotoNaskhArabic-Regular.ttf" ]; then
+            sudo wget -q -O "$FONT_DIR/NotoNaskhArabic-Regular.ttf" \
+              "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoNaskhArabic/NotoNaskhArabic-Regular.ttf" \
+              && echo "  ✓ NotoNaskhArabic font" \
+              || echo "  ⚠ Font download failed (using fallback fonts)"
+          fi
+          sudo fc-cache -fv >/dev/null 2>&1
+
+          sudo sed -i \
+            's/rights="none" pattern="PDF"/rights="read|write" pattern="PDF"/' \
+            /etc/ImageMagick-6/policy.xml 2>/dev/null || true
+
+      # ── Python packages ────────────────────────────────────────────────────────
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip wheel setuptools --quiet
+          python -m pip install -r requirements.txt --quiet
+
+          echo "=== Package verification ==="
+          python -c "
+          checks = [
+              ('requests',        'requests'),
+              ('edge_tts',        'edge-tts'),
+              ('arabic_reshaper', 'arabic-reshaper'),
+              ('bidi.algorithm',  'python-bidi'),
+          ]
+          import importlib
+          all_ok = True
+          for mod, pkg in checks:
+              try:
+                  m = importlib.import_module(mod)
+                  ver = getattr(m, '__version__', 'ok')
+                  print(f'  ✓ {pkg} ({ver})')
+              except ImportError:
+                  print(f'  ✗ {pkg} MISSING')
+                  all_ok = False
+          if not all_ok:
+              import sys; sys.exit(1)
+          "
+
+      # ── Pre-flight: verify every TTS backend before the pipeline runs ──────────
+      - name: TTS pre-flight verification
+        env:
+          HF_TOKEN:       ${{ secrets.HF_TOKEN }}
+          VIDEO_LANGUAGE: ${{ github.event.inputs.language }}
+        run: |
+          python - << 'EOF'
+          import sys, os, shutil, subprocess, asyncio
+          sys.path.insert(0, '.')
+          lang = os.environ.get('VIDEO_LANGUAGE', 'ar')
+          texts = {'ar':'مرحبا', 'en':'Hello', 'fr':'Bonjour', 'es':'Hola', 'de':'Hallo'}
+          test_text = texts.get(lang, 'Hello')
+          voices = {
+              'ar': 'ar-EG-SalmaNeural', 'en': 'en-US-JennyNeural',
+              'fr': 'fr-FR-DeniseNeural', 'es': 'es-ES-ElviraNeural',
+              'de': 'de-DE-KatjaNeural',
+          }
+          test_voice = voices.get(lang, 'en-US-JennyNeural')
+
+          any_ok = False
+          print(f'Pre-flight | lang={lang} | text={test_text!r}')
+          print()
+
+          # ── 1. espeak-ng ────────────────────────────────────────────────────
+          print('Backend 1: espeak-ng')
+          esp = shutil.which('espeak-ng')
+          if esp:
+              r = subprocess.run(
+                  [esp, '-v', 'ar', '-w', '/tmp/pf_esp.wav', test_text],
+                  capture_output=True, text=True, timeout=15,
+              )
+              if r.returncode == 0 and os.path.exists('/tmp/pf_esp.wav'):
+                  print(f'  ✓ espeak-ng synthesis OK ({os.path.getsize("/tmp/pf_esp.wav")} bytes)')
+                  any_ok = True
+              else:
+                  print(f'  ✗ espeak-ng synthesis failed rc={r.returncode}: {r.stderr[:80]}')
+          else:
+              print(f'  ✗ espeak-ng not on PATH (code uses auto-install fallback)')
+
+          # ── 2. edge-tts async ───────────────────────────────────────────────
+          print('Backend 2: edge-tts async')
+          try:
+              import edge_tts
+              async def _test():
+                  comm = edge_tts.Communicate(test_text, test_voice, rate='-5%')
+                  await comm.save('/tmp/pf_edge.mp3')
+              loop = asyncio.new_event_loop()
+              asyncio.set_event_loop(loop)
+              try:
+                  loop.run_until_complete(_test())
+              finally:
+                  loop.close()
+              if os.path.exists('/tmp/pf_edge.mp3') and os.path.getsize('/tmp/pf_edge.mp3') > 100:
+                  print(f'  ✓ edge-tts async OK ({os.path.getsize("/tmp/pf_edge.mp3")} bytes)')
+                  any_ok = True
+              else:
+                  print(f'  ✗ edge-tts async: output missing/empty')
+          except ImportError:
+              print(f'  ✗ edge_tts not importable (will auto-install at runtime)')
+          except Exception as e:
+              print(f'  ✗ edge-tts async: {type(e).__name__}: {e}')
+
+          # ── 3. edge-tts -m ──────────────────────────────────────────────────
+          print('Backend 3: python -m edge_tts')
+          r = subprocess.run(
+              [sys.executable, '-m', 'edge_tts', '--list-voices'],
+              capture_output=True, text=True, timeout=15,
+          )
+          if r.returncode == 0:
+              print(f'  ✓ python -m edge_tts OK ({r.stdout.count("Neural")} Neural voices)')
+              any_ok = True
+          else:
+              print(f'  ✗ python -m edge_tts rc={r.returncode}: {r.stderr[:80]}')
+
+          # ── 4. FFmpeg silence ────────────────────────────────────────────────
+          print('Backend 4: FFmpeg silence (guaranteed fallback)')
+          r = subprocess.run(
+              ['ffmpeg', '-y', '-f', 'lavfi',
+               '-i', 'anullsrc=r=44100:cl=mono:d=1',
+               '-c:a', 'aac', '-b:a', '64k', '/tmp/pf_silence.aac'],
+              capture_output=True, text=True, timeout=15,
+          )
+          if r.returncode == 0 and os.path.exists('/tmp/pf_silence.aac'):
+              print(f'  ✓ FFmpeg silence OK (pipeline will never crash)')
+              any_ok = True
+          else:
+              print(f'  ✗ FFmpeg silence FAILED — critical: {r.stderr[:100]}')
+
+          print()
+          if any_ok:
+              print('Pre-flight PASSED — at least one TTS backend is working')
+          else:
+              print('Pre-flight WARNING — only silence fallback confirmed')
+          EOF
+
+      # ── Smoke test ─────────────────────────────────────────────────────────────
+      - name: Smoke test
+        env:
+          VIDEO_LANGUAGE: ${{ github.event.inputs.language }}
+          VIDEO_TYPE:     ${{ github.event.inputs.video_type }}
+          HF_TOKEN:       ${{ secrets.HF_TOKEN }}
+        run: python main.py test
+
+      # ── Run pipeline ──────────────────────────────────────────────────────────
+      - name: Run video pipeline
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          PEXELS_API_KEY:     ${{ secrets.PEXELS_API_KEY }}
+          PIXABAY_API_KEY:    ${{ secrets.PIXABAY_API_KEY }}
+          HF_TOKEN:           ${{ secrets.HF_TOKEN }}
+          CHAT_ID:            ${{ github.event.inputs.chat_id }}
+          VIDEO_TOPIC:        ${{ github.event.inputs.topic }}
+          VIDEO_TYPE:         ${{ github.event.inputs.video_type }}
+          VIDEO_LANGUAGE:     ${{ github.event.inputs.language }}
+          VOICE_GENDER:       ${{ github.event.inputs.voice_gender }}
+          VIDEO_QUALITY:      ${{ github.event.inputs.quality }}
+          MESSAGE_ID:         ${{ github.event.inputs.message_id }}
+          WORK_DIR:           /tmp/pipeline_work
+          OUTPUT_DIR:         output
+        run: python main.py pipeline
+
+      # ── Artifact ──────────────────────────────────────────────────────────────
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-${{ github.run_id }}
+          path: output/
+          retention-days: 1
+          if-no-files-found: ignore

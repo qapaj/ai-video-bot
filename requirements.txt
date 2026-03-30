@@ -1,0 +1,24 @@
+# ── Core HTTP & Telegram ─────────────────────────────────────────────────────
+requests==2.31.0
+python-telegram-bot==20.7
+
+# ── Arabic text shaping (CRITICAL — fixes disconnected letters) ───────────────
+arabic-reshaper==3.0.0
+python-bidi==0.4.2
+
+# ── TTS — Microsoft Neural voices (no API key, no model download) ─────────────
+edge-tts==6.1.9
+
+# ── Video processing ──────────────────────────────────────────────────────────
+moviepy==1.0.3
+Pillow==10.2.0
+imageio==2.33.0
+imageio-ffmpeg==0.4.9
+
+# ── Audio processing ──────────────────────────────────────────────────────────
+pydub==0.25.1
+soundfile==0.12.1
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+tqdm==4.66.1
+beautifulsoup4==4.12.2
